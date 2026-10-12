@@ -10,6 +10,9 @@ pub const FONT_PROSE: &str = "Geist";
 /// than semibold.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(450.0);
 
+/// Heading weight for rendered Markdown structure.
+pub const WEIGHT_SEMIBOLD: FontWeight = FontWeight(600.0);
+
 // Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
 pub fn fade_in(color: u32, k: f32) -> u32 {
     let a = ((color & 0xFF) as f32 * k).round() as u32;

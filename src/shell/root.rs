@@ -15,9 +15,9 @@ use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, TAB_BAR_HEIGHT, TOP_BAR_HEIGHT
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
-use crate::editor::EditorState;
+use crate::editor::{EditorState, SpanKind};
 use crate::persist::Store;
-use crate::theme::WEIGHT_MEDIUM;
+use crate::theme::{WEIGHT_MEDIUM, WEIGHT_SEMIBOLD};
 
 /// Plus-in-document icon for New File.
 const ICON_NEW_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -42,6 +42,8 @@ const ICON_OPEN_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width=
 pub struct Tab {
     pub id: usize,
     pub title: String,
+    /// Backing file path, if any. Write-through keeps it in sync.
+    pub path: Option<String>,
 }
 
 /// Layer toggle flags for the bottom-bar cluster.
@@ -51,7 +53,7 @@ pub const LAYER_PROSE: u8 = 1;
 const MANUSCRIPT_FONT_SIZE: f32 = 15.0;
 const MANUSCRIPT_LINE_HEIGHT: f32 = 24.0;
 const MANUSCRIPT_TOP_PAD: f32 = 24.0;
-const RULER_HEIGHT: f32 = 30.0;
+const RULER_HEIGHT: f32 = 24.0;
 const CARET_HEIGHT: f32 = 17.0;
 /// Logical pixels per ruler inch.
 const PX_PER_INCH: f32 = 96.0;
@@ -59,6 +61,7 @@ const PX_PER_INCH: f32 = 96.0;
 /// window resizes never re-wrap the text.
 const DEFAULT_MEASURE: f32 = 720.0;
 const MIN_MEASURE: f32 = 80.0;
+const OVERFLOW_GUTTER: f32 = 6.0;
 
 /// Which ruler stick is being dragged.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,18 +91,179 @@ fn manuscript_geometry(
     measure_base: f32,
 ) -> ManuscriptGeometry {
     let col = (view_w - left_occ - right_occ).max(0.0);
-    let margin = ((col - measure_base) / 2.0).max(0.0);
+    // Preserve a small readable left gutter once the column becomes
+    // narrower than the manuscript measure; further overflow clips right.
+    let margin = ((col - measure_base) / 2.0).max(OVERFLOW_GUTTER);
     ManuscriptGeometry { col_w: col, margin, measure: measure_base }
+}
+
+fn manuscript_text_left(geo: &ManuscriptGeometry) -> f32 {
+    geo.margin
 }
 
 /// Render-ready snapshot of the active buffer. Keeps borrows short: the
 /// entity builds this once, then renders from plain data.
-struct SnapshotRow {
+#[derive(Clone)]
+struct SnapshotSeg {
     text: String,
-    /// Caret x (px) within the row, if the cursor is here.
-    caret_x: Option<f32>,
+    size: f32,
+    weight: FontWeight,
+    mono: bool,
+    color: u32,
+    code_bg: bool,
+    src_start: usize,
+    src_end: usize,
+}
+
+struct BuiltRow {
+    buffer_line: usize,
+    segs: Vec<SnapshotSeg>,
+    rule: bool,
+}
+
+struct SnapshotRow {
+    segs: Vec<SnapshotSeg>,
+    /// Caret (x, height) within the row, if the cursor is here.
+    caret: Option<(f32, f32)>,
     /// Selection x-range (px) within the row, if any overlaps it.
     sel_px: Option<(f32, f32)>,
+    rule: bool,
+}
+
+/// Resolve a span kind to metrics. Colors resolve separately so metrics
+/// stay UI-agnostic.
+fn seg_metrics(kind: SpanKind, base_size: f32, base_weight: FontWeight) -> (f32, FontWeight, bool) {
+    match kind {
+        SpanKind::Plain => (base_size, base_weight, false),
+        SpanKind::Marker => (base_size, base_weight, false),
+        SpanKind::Bold => (base_size, FontWeight(700.0), false),
+        SpanKind::Italic => (base_size, base_weight, false),
+        SpanKind::Strike => (base_size, base_weight, false),
+        SpanKind::Code => (base_size, base_weight, true),
+    }
+}
+
+/// Resolve a span kind to display color + code wash. Metrics unaffected.
+fn seg_chrome(kind: SpanKind, t: crate::theme::Theme) -> (u32, bool) {
+    match kind {
+        SpanKind::Plain | SpanKind::Bold => (t.text_primary, false),
+        SpanKind::Marker => (t.accent, false),
+        SpanKind::Italic => (t.text_secondary, false),
+        SpanKind::Strike => (t.empty_text_secondary, false),
+        SpanKind::Code => (t.text_primary, true),
+    }
+}
+
+/// Base type for a buffer line: headings render larger and semibold.
+fn base_measure(line_text: &str) -> (f32, FontWeight) {
+    match crate::editor::heading_level(line_text) {
+        1 => (21.0, WEIGHT_SEMIBOLD),
+        2 => (18.0, WEIGHT_SEMIBOLD),
+        3 => (16.0, WEIGHT_SEMIBOLD),
+        _ => (MANUSCRIPT_FONT_SIZE, FontWeight::NORMAL),
+    }
+}
+
+/// Lay out one buffer line into styled rows: parse (hiding markup unless
+/// the cursor is here), wrap the visible text, slice spans per row.
+/// `hidden` is false for the cursor's line (raw source view).
+fn layout_line(
+    line_no: usize,
+    line_text: &str,
+    hidden: bool,
+    measure: f32,
+    window: &mut Window,
+    t: crate::theme::Theme,
+) -> Vec<BuiltRow> {
+    if hidden && crate::editor::is_hr_line(line_text) {
+        return vec![BuiltRow { buffer_line: line_no, segs: Vec::new(), rule: true }];
+    }
+    let (base_size, base_weight) = base_measure(line_text);
+    let marker = if crate::editor::heading_level(line_text) > 0 {
+        crate::editor::heading_marker_len(line_text)
+    } else {
+        0
+    };
+    let spans = if hidden {
+        crate::editor::parse_line(line_text, true, marker)
+    } else {
+        crate::editor::parse_active_line(line_text, marker)
+    };
+    // Visible text + per-span visible offsets.
+    let mut visible = String::new();
+    let mut voffs: Vec<(usize, usize)> = Vec::new();
+    for s in spans.iter() {
+        let vstart = visible.len();
+        visible.push_str(&line_text[s.start..s.end]);
+        voffs.push((vstart, visible.len()));
+    }
+    let color = Hsla::from(rgba(t.text_primary));
+    // Styled width of a visible byte range (sums per-span slices).
+    let mut width_of = |a: usize, b: usize| -> f32 {
+        if a >= b {
+            return 0.0;
+        }
+        let mut w = 0.0;
+        for (idx, s) in spans.iter().enumerate() {
+            let (vs, ve) = voffs[idx];
+            let o0 = a.max(vs);
+            let o1 = b.min(ve);
+            if o0 >= o1 {
+                continue;
+            }
+            let (size, weight, mono) = seg_metrics(s.kind, base_size, base_weight);
+            w += measure_text(window, &visible[o0..o1], color, size, weight, mono);
+        }
+        w
+    };
+    crate::editor::wrap_visible(&visible, measure, &mut width_of)
+        .into_iter()
+        .map(|(a, b)| {
+            let mut segs = Vec::new();
+            for (idx, s) in spans.iter().enumerate() {
+                let (vs, ve) = voffs[idx];
+                let o0 = a.max(vs);
+                let o1 = b.min(ve);
+                if o0 >= o1 {
+                    continue;
+                }
+                let (size, weight, mono) = seg_metrics(s.kind, base_size, base_weight);
+                let (color_u32, code_bg) = seg_chrome(s.kind, t);
+                // Visible offsets back to source bytes.
+                let src_a = s.start + (o0 - vs);
+                let src_b = s.start + (o1 - vs);
+                segs.push(SnapshotSeg {
+                    text: visible[o0..o1].to_string(),
+                    size,
+                    weight,
+                    mono,
+                    color: color_u32,
+                    code_bg,
+                    src_start: src_a,
+                    src_end: src_b,
+                });
+            }
+            BuiltRow { buffer_line: line_no, segs, rule: false }
+        })
+        .collect()
+}
+
+/// x and segment size for a line-local source byte within shaped row segs.
+/// Gap bytes snap to the next segment start (first match wins).
+fn locate_src(shaped: &[(SnapshotSeg, ShapedLine, f32)], src: usize) -> (f32, f32) {
+    let mut x = 0.0;
+    for (seg, sh, w) in shaped {
+        if src < seg.src_start {
+            return (x, seg.size);
+        }
+        if src <= seg.src_end {
+            let rel = (src - seg.src_start).min(seg.text.len());
+            return (x + sh.split_at(rel).0.width().as_f32(), seg.size);
+        }
+        x += w;
+    }
+    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(MANUSCRIPT_FONT_SIZE);
+    (x, size)
 }
 
 struct EditorSnapshot {
@@ -111,21 +275,35 @@ struct EditorSnapshot {
 }
 
 /// Shape-measured width of a manuscript string via the window text system.
-fn measure_text(window: &mut Window, text: &str, color: Hsla) -> f32 {
+fn measure_text(
+    window: &mut Window,
+    text: &str,
+    color: Hsla,
+    size: f32,
+    weight: FontWeight,
+    mono: bool,
+) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
-    shape_row(window, text, color).width().as_f32()
+    shape_row(window, text, color, size, weight, mono).width().as_f32()
 }
 
-/// Shape one manuscript row in the manuscript font. Callers split edges
-/// from the returned layout so positions match rendered text exactly.
-fn shape_row(window: &mut Window, text: &str, color: Hsla) -> ShapedLine {
+/// Shape one manuscript run. Callers split edges from the returned layout
+/// so positions match rendered text exactly.
+fn shape_row(
+    window: &mut Window,
+    text: &str,
+    color: Hsla,
+    size: f32,
+    weight: FontWeight,
+    mono: bool,
+) -> ShapedLine {
     let font = Font {
-        family: crate::theme::FONT_PROSE.into(),
+        family: (if mono { crate::theme::FONT_MONO } else { crate::theme::FONT_PROSE }).into(),
         features: FontFeatures::default(),
         fallbacks: None,
-        weight: FontWeight::NORMAL,
+        weight,
         style: FontStyle::Normal,
     };
     let run = TextRun {
@@ -138,7 +316,7 @@ fn shape_row(window: &mut Window, text: &str, color: Hsla) -> ShapedLine {
     };
     window
         .text_system()
-        .shape_line(text.to_string().into(), px(MANUSCRIPT_FONT_SIZE), &[run], None)
+        .shape_line(text.to_string().into(), px(size), &[run], None)
 }
 
 pub struct RootView {
@@ -176,6 +354,11 @@ pub struct RootView {
     blink_started: bool,
     /// Vertical scroll offset (px) of the manuscript viewport.
     scroll_offset: f32,
+    /// Scrollbar drag: (pointer start y, scroll offset at start).
+    scroll_drag: Option<(f32, f32)>,
+    /// Number of rendered manuscript rows from the most recent frame.
+    scroll_content_rows: usize,
+    scrollbar_hovered: bool,
     /// True while the left button is held for manuscript mouse selection.
     mouse_select: bool,
     // -- hamburger menu state (Parametric behavior) --
@@ -190,20 +373,51 @@ pub struct RootView {
     cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
 }
 
+/// The Prose documents folder inside the user's documents, created on
+/// demand. New files land here.
+fn default_docs_dir() -> std::path::PathBuf {
+    let dir = dirs::document_dir()
+        .map(|d| d.join("Prose"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// What `save_step` decided, so the app can run dialogs borrow-free.
+#[derive(Clone)]
+pub enum SaveStep {
+    Nothing,
+    WriteActive,
+    AskDialog(String),
+}
+
 impl RootView {
     pub fn new(cx: &mut Context<Self>, store: Store) -> Self {
-        // Restore tabs; fall back to a fresh Welcome + Untitled session.
+        // Restore tabs: `P<path>` reopens real files (content preloaded),
+        // `T<title>` restores untitled placeholders.
         let mut tabs: Vec<Tab> = Vec::new();
         let mut next_tab_id = 0;
-        if let Some(saved) = store.get("tabs.titles") {
-            for title in saved.split('\n').filter(|s| !s.is_empty()) {
-                tabs.push(Tab { id: next_tab_id, title: title.to_string() });
-                next_tab_id += 1;
+        let mut preloaded: HashMap<usize, String> = HashMap::new();
+        if let Some(saved) = store.get("tabs") {
+            for entry in saved.split('\n').filter(|s| !s.is_empty()) {
+                if let Some(path) = entry.strip_prefix('P') {
+                    let title = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string());
+                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                    preloaded.insert(next_tab_id, content);
+                    tabs.push(Tab { id: next_tab_id, title, path: Some(path.to_string()) });
+                    next_tab_id += 1;
+                } else if let Some(title) = entry.strip_prefix('T') {
+                    tabs.push(Tab { id: next_tab_id, title: title.to_string(), path: None });
+                    next_tab_id += 1;
+                }
             }
         }
         if tabs.is_empty() {
-            tabs.push(Tab { id: 0, title: "Welcome".into() });
-            tabs.push(Tab { id: 1, title: "Untitled".into() });
+            tabs.push(Tab { id: 0, title: "Welcome".into(), path: None });
+            tabs.push(Tab { id: 1, title: "Untitled".into(), path: None });
             next_tab_id = 2;
         }
         let active_tab = store
@@ -227,8 +441,12 @@ impl RootView {
         }
 
         let base_measure = width("manuscript.measure", DEFAULT_MEASURE);
+        let recent_files: Vec<String> = store
+            .get("recents")
+            .map(|v| v.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default();
 
-        Self {
+        let mut view = Self {
             tabs,
             active_tab,
             next_tab_id,
@@ -242,7 +460,7 @@ impl RootView {
             preview_style: None,
             syntax_on: false,
             prose_on: false,
-            recent_files: Vec::new(),
+            recent_files,
             hovered_tab: None,
             store,
             editors: HashMap::new(),
@@ -252,6 +470,9 @@ impl RootView {
             caret_visible: true,
             blink_started: false,
             scroll_offset: 0.0,
+            scroll_drag: None,
+            scroll_content_rows: 0,
+            scrollbar_hovered: false,
             mouse_select: false,
             menu_open: false,
             active_menu: None,
@@ -262,7 +483,15 @@ impl RootView {
             fade_pending: HashMap::new(),
             fade_tween_active: HashSet::new(),
             cursor_trail: Vec::new(),
+        };
+        // Preload reopened files into their buffers.
+        for (id, content) in preloaded {
+            view.editors
+                .entry(id)
+                .or_insert_with(EditorState::new)
+                .set_text(&content);
         }
+        view
     }
 
     fn default_dock(kind: PanelKind) -> DockSide {
@@ -298,10 +527,18 @@ impl RootView {
             self.store
                 .set(&format!("panels.dock.{}", kind.key()), side);
         }
-        let titles: Vec<&str> = self.tabs.iter().map(|t| t.title.as_str()).collect();
-        self.store.set("tabs.titles", &titles.join("\n"));
+        let tabs: Vec<String> = self
+            .tabs
+            .iter()
+            .map(|t| match t.path.as_ref() {
+                Some(p) => format!("P{p}"),
+                None => format!("T{}", t.title),
+            })
+            .collect();
+        self.store.set("tabs", &tabs.join("\n"));
         self.store.set("tabs.active", &self.active_tab.to_string());
         self.store.set("manuscript.measure", &self.measure_base.to_string());
+        self.store.set("recents", &self.recent_files.join("\n"));
     }
 
     // ----- tabs -----
@@ -318,7 +555,11 @@ impl RootView {
         if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs.remove(i);
             if self.tabs.is_empty() {
-                self.tabs.push(Tab { id: self.next_tab_id, title: "Welcome".into() });
+                self.tabs.push(Tab {
+                    id: self.next_tab_id,
+                    title: "Welcome".into(),
+                    path: None,
+                });
                 self.next_tab_id += 1;
             }
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
@@ -333,14 +574,26 @@ impl RootView {
             self.close_tab(id, cx);
         }
     }
-
-    pub fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.tabs.push(Tab { id, title: format!("Untitled {}", id) });
-        self.active_tab = self.tabs.len() - 1;
-        self.save_layout();
-        cx.notify();
+    /// Create a real file in the Prose documents folder and open it.
+    pub fn new_file(&mut self, cx: &mut Context<Self>) {
+        let dir = default_docs_dir();
+        let mut n = 0;
+        let path = loop {
+            let name = if n == 0 {
+                "Untitled.md".to_string()
+            } else {
+                format!("Untitled {}.md", n + 1)
+            };
+            let candidate = dir.join(&name);
+            if !candidate.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        if std::fs::write(&path, "").is_err() {
+            return;
+        }
+        self.open_file_path(path.to_string_lossy().into_owned(), cx);
     }
 
     pub fn open_welcome(&mut self, cx: &mut Context<Self>) {
@@ -349,7 +602,7 @@ impl RootView {
         } else {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
-            self.tabs.push(Tab { id, title: "Welcome".into() });
+            self.tabs.push(Tab { id, title: "Welcome".into(), path: None });
             self.active_tab = self.tabs.len() - 1;
         }
         self.save_layout();
@@ -376,6 +629,35 @@ impl RootView {
         cx.notify();
     }
 
+    fn standard_measure_label(measure: f32) -> Option<&'static str> {
+        const STANDARDS: &[(f32, &str)] = &[
+            (6.0, "Narrow"),
+            (6.5, "Standard"),
+            (6.75, "Manuscript"),
+            (7.0, "Wide"),
+            (7.5, "Extra Wide"),
+            (8.0, "Full Width"),
+        ];
+        STANDARDS
+            .iter()
+            .find(|(inches, _)| (measure - inches * PX_PER_INCH).abs() < 0.5)
+            .map(|(_, label)| *label)
+    }
+
+    fn measure_label(measure: f32) -> String {
+        if let Some(label) = Self::standard_measure_label(measure) {
+            return label.to_string();
+        }
+        let mut value = format!("{:.2}", measure / PX_PER_INCH);
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+        format!("{} in", value)
+    }
+
     /// Either stick sets the measure: dragging the left stick right or the
     /// right stick left narrows the text, mirrored. Margins re-derive.
     fn margin_drag_to(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -389,7 +671,12 @@ impl RootView {
             MarginSide::Right => -dx * 2.0,
         };
         let max = geo.col_w.max(MIN_MEASURE);
-        let next = (start_measure + delta).clamp(MIN_MEASURE, max);
+        let raw = (start_measure + delta).clamp(MIN_MEASURE, max);
+        let next = [6.0_f32, 6.5, 6.75, 7.0, 7.5, 8.0]
+            .into_iter()
+            .map(|inches| inches * PX_PER_INCH)
+            .find(|candidate| (raw - candidate).abs() <= 2.0)
+            .unwrap_or(raw);
         self.measure_base = next;
         self.margin_drag = Some((side, x, next));
         cx.notify();
@@ -486,6 +773,8 @@ impl RootView {
             }
         }
         self.caret_visible = true;
+        // Write-through: every keystroke lands on disk immediately.
+        self.save_active();
         cx.notify();
     }
 
@@ -499,44 +788,24 @@ impl RootView {
         else {
             return;
         };
-        // Measure with the window text system (cached per content).
         let color = Hsla::from(rgba(crate::theme::active(cx).text_primary));
         let geo = self.geometry(window);
-        let mut width_of = |s: &str| -> f32 {
-            if s.is_empty() {
-                return 0.0;
-            }
-            let font = Font {
-                family: crate::theme::FONT_PROSE.into(),
-                features: FontFeatures::default(),
-                fallbacks: None,
-                weight: FontWeight::NORMAL,
-                style: FontStyle::Normal,
-            };
-            let run = TextRun {
-                len: s.len(),
-                font,
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_line(s.to_string().into(), px(MANUSCRIPT_FONT_SIZE), &[run], None)
-                .width()
-                .as_f32()
-        };
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
         let (cur_line, cur_byte) = ed.cursor_line_byte();
-        // Rows for the cursor line and its neighbors.
-        let mut rows = Vec::new();
+        // Rows for the cursor line and its neighbors, with their type.
+        let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
         for line in cur_line.saturating_sub(1)..=(cur_line + 1).min(ed.len_lines().saturating_sub(1)) {
             let text = ed.line_text(line);
-            rows.extend(crate::editor::wrap_line(line, &text, geo.measure, &mut width_of));
+            let (size, weight) = base_measure(&text);
+            let mut w = |s: &str| measure_text(window, s, color, size, weight, false);
+            rows.extend(
+                crate::editor::wrap_line(line, &text, geo.measure, &mut w)
+                    .into_iter()
+                    .map(|r| (r, size, weight)),
+            );
         }
         let mut current = None;
-        for (i, row) in rows.iter().enumerate() {
+        for (i, (row, _, _)) in rows.iter().enumerate() {
             if row.buffer_line == cur_line && row.start_byte <= cur_byte && cur_byte <= row.end_byte
             {
                 current = Some(i);
@@ -548,19 +817,21 @@ impl RootView {
         if target < 0 || target >= rows.len() as i32 {
             return;
         }
-        let target = &rows[target as usize];
+        let (cur_row, size, weight) = rows[current].clone();
+        let (target_row, target_size, target_weight) = rows[target as usize].clone();
         // Caret x on the current row, then the widest prefix fitting it.
-        let cur_row = &rows[current];
         let rel = cur_byte.min(cur_row.end_byte).saturating_sub(cur_row.start_byte);
         let row_text = ed.line_text(cur_row.buffer_line);
         let row_slice = &row_text[cur_row.start_byte..cur_row.end_byte.min(row_text.len())];
         let prefix = &row_slice[..rel.min(row_slice.len())];
-        let x = width_of(prefix);
-        let target_text = ed.line_text(target.buffer_line);
+        let x = measure_text(window, prefix, color, size, weight, false);
+        let target_text = ed.line_text(target_row.buffer_line);
         let target_slice =
-            &target_text[target.start_byte..target.end_byte.min(target_text.len())];
-        let lo = crate::editor::byte_for_x(target_slice, x, &mut width_of);
-        ed.set_cursor_line_byte(target.buffer_line, target.start_byte + lo, extend);
+            &target_text[target_row.start_byte..target_row.end_byte.min(target_text.len())];
+        let lo = crate::editor::byte_for_x(target_slice, x, &mut |s: &str| {
+            measure_text(window, s, color, target_size, target_weight, false)
+        });
+        ed.set_cursor_line_byte(target_row.buffer_line, target_row.start_byte + lo, extend);
     }
 
     /// Wheel scrolling over the manuscript viewport.
@@ -572,32 +843,39 @@ impl RootView {
         if dy == 0.0 {
             return;
         }
-        let color = Hsla::from(rgba(crate::theme::active(cx).text_primary));
-        let max = self.max_scroll(window, color);
-        self.scroll_offset = (self.scroll_offset + dy).clamp(0.0, max);
+        let max = self.scroll_max_for_geometry(Self::viewport_h(window), 0.0);
+        self.scroll_offset = (self.scroll_offset - dy).clamp(0.0, max);
         cx.notify();
     }
 
-    /// Maximum scroll offset for the active buffer at the current wrap.
-    fn max_scroll(&mut self, window: &mut Window, color: Hsla) -> f32 {
-        let Some(tab_id) = self
-            .tabs
-            .get(self.active_tab)
-            .filter(|tab| tab.title != "Welcome")
-            .map(|tab| tab.id)
-        else {
-            return 0.0;
-        };
-        let geo = self.geometry(window);
-        let view_h = Self::viewport_h(window);
-        let mut width_of = |s: &str| -> f32 { measure_text(window, s, color) };
-        let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
-        let mut count = 0;
-        for line_no in 0..ed.len_lines() {
-            let text = ed.line_text(line_no);
-            count += crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of).len();
+    fn begin_scroll_drag(&mut self, pointer_y: f32, thumb_top: f32, thumb_height: f32, track_h: f32, view_h: f32, cx: &mut Context<Self>) {
+        let track_y = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + RULER_HEIGHT;
+        let local_y = pointer_y - track_y;
+        let max = self.scroll_max_for_geometry(view_h, thumb_height);
+        if local_y >= thumb_top && local_y <= thumb_top + thumb_height {
+            self.scroll_drag = Some((pointer_y, self.scroll_offset));
+        } else if max > 0.0 {
+            let target = (local_y - thumb_height / 2.0)
+                .clamp(0.0, (track_h - thumb_height).max(0.0));
+            self.scroll_offset = target / (track_h - thumb_height).max(1.0) * max;
+            self.scroll_drag = Some((pointer_y, self.scroll_offset));
         }
-        ((count as f32 * MANUSCRIPT_LINE_HEIGHT) - view_h).max(0.0)
+        cx.notify();
+    }
+
+    fn scroll_drag_to(&mut self, pointer_y: f32, track_h: f32, view_h: f32, thumb_height: f32, cx: &mut Context<Self>) {
+        let Some((start_y, start_offset)) = self.scroll_drag else { return };
+        let max = self.scroll_max_for_geometry(view_h, thumb_height);
+        let travel = (track_h - thumb_height).max(1.0);
+        let delta = (pointer_y - start_y) / travel * max;
+        self.scroll_offset = (start_offset + delta).clamp(0.0, max);
+        cx.notify();
+    }
+
+    fn scroll_max_for_geometry(&self, view_h: f32, thumb_height: f32) -> f32 {
+        let total_h = self.scroll_content_rows as f32 * MANUSCRIPT_LINE_HEIGHT;
+        let _ = thumb_height;
+        (total_h - view_h).max(0.0)
     }
 
     /// Move the cursor to a window point (click / drag). Coordinates are
@@ -629,12 +907,18 @@ impl RootView {
         }
         let y_view = y_win - (TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + RULER_HEIGHT);
         let view_h = Self::viewport_h(window);
-        let mut width_of = |s: &str| -> f32 { measure_text(window, s, color) };
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
-        let mut rows = Vec::new();
+        // Rows carry their line's type for measurement.
+        let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
         for line_no in 0..ed.len_lines() {
             let text = ed.line_text(line_no);
-            rows.extend(crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of));
+            let (size, weight) = base_measure(&text);
+            let mut width_of = |s: &str| measure_text(window, s, color, size, weight, false);
+            rows.extend(
+                crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of)
+                    .into_iter()
+                    .map(|r| (r, size, weight)),
+            );
         }
         if rows.is_empty() {
             return;
@@ -647,13 +931,16 @@ impl RootView {
             .floor()
             .max(0.0) as usize;
         let idx = idx.min(rows.len() - 1);
-        let row = &rows[idx];
-        // Text block is centered: its left edge in column coordinates.
-        let text_left = (geo.col_w - geo.measure) / 2.0;
+        let (row, size, weight) = rows[idx].clone();
+        // Keep the left edge visible when the column is wider than the
+        // viewport: margins are consumed before the text itself is clipped.
+        let text_left = manuscript_text_left(&geo);
         let x_text = x_col - text_left;
         let row_text = ed.line_text(row.buffer_line);
         let row_slice = &row_text[row.start_byte..row.end_byte.min(row_text.len())];
-        let byte = crate::editor::byte_for_x(row_slice, x_text, &mut width_of);
+        let byte = crate::editor::byte_for_x(row_slice, x_text, &mut |s: &str| {
+            measure_text(window, s, color, size, weight, false)
+        });
         ed.set_cursor_line_byte(row.buffer_line, row.start_byte + byte, extend);
         self.caret_visible = true;
         cx.notify();
@@ -663,6 +950,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.undo();
         }
+        self.save_active();
         cx.notify();
     }
 
@@ -670,6 +958,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.redo();
         }
+        self.save_active();
         cx.notify();
     }
 
@@ -915,26 +1204,73 @@ impl RootView {
 
     // ----- files -----
 
-    /// Native open-file dialog. Blocks the UI thread while open, like any
-    /// native modal; the pick itself is instant.
-    pub fn pick_file(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new().pick_file() {
-            self.open_file_path(path.to_string_lossy().into_owned(), cx);
-        }
-    }
-
+    /// Open a path in a new tab, loading its content into the buffer.
     pub fn open_file_path(&mut self, path: String, cx: &mut Context<Self>) {
         let title = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or(path.clone());
+            .unwrap_or_else(|| path.clone());
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
         self.recent_files.retain(|p| p != &path);
-        self.recent_files.insert(0, path);
+        self.recent_files.insert(0, path.clone());
         self.recent_files.truncate(12);
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        self.tabs.push(Tab { id, title });
+        self.tabs.push(Tab { id, title, path: Some(path) });
         self.active_tab = self.tabs.len() - 1;
+        self.editors
+            .entry(id)
+            .or_insert_with(EditorState::new)
+            .set_text(&content);
+        self.scroll_offset = 0.0;
+        self.save_layout();
+        cx.notify();
+    }
+
+    /// Write the active tab's buffer to its file. No-op without a path.
+    fn save_active(&self) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let Some(path) = tab.path.as_ref() else {
+            return;
+        };
+        if let Some(ed) = self.editors.get(&tab.id) {
+            let _ = std::fs::write(path, ed.text_string());
+        }
+    }
+
+    /// Save the active tab, asking for a path when it has none.
+    /// Never shows a dialog itself: callers run the dialog with no entity
+    /// borrow held (a pumping native modal re-enters the app and panics
+    /// against a held borrow), then apply the picked path here.
+    pub fn save_step(&self) -> SaveStep {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return SaveStep::Nothing;
+        };
+        if tab.path.is_some() {
+            return SaveStep::WriteActive;
+        }
+        if tab.title == "Welcome" || tab.title.is_empty() {
+            return SaveStep::Nothing;
+        }
+        SaveStep::AskDialog(format!("{}.md", tab.title))
+    }
+
+    /// Apply a save: write the active buffer, adopting `path` first when
+    /// the tab had none.
+    pub fn save_to(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        if let Some(path) = path {
+            let title = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(path.clone());
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.path = Some(path);
+                tab.title = title;
+            }
+        }
+        self.save_active();
         self.save_layout();
         cx.notify();
     }
@@ -965,7 +1301,9 @@ impl RootView {
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
-        let was_dragging = self.drag.take().is_some() || self.margin_drag.take().is_some();
+        let was_dragging = self.drag.take().is_some()
+            || self.margin_drag.take().is_some()
+            || self.scroll_drag.take().is_some();
         self.mouse_select = false;
         if was_dragging {
             self.save_layout();
@@ -981,6 +1319,14 @@ impl RootView {
             - RULER_HEIGHT
             - BOTTOM_BAR_HEIGHT)
             .max(0.0)
+    }
+
+    fn scrollbar_thumb_height(&self, window: &mut Window) -> f32 {
+        let track_h = Self::viewport_h(window);
+        let total_h = self.scroll_content_rows as f32 * MANUSCRIPT_LINE_HEIGHT;
+        (track_h / total_h.max(1.0) * track_h)
+            .max(24.0)
+            .min(track_h)
     }
 
     // ----- render -----
@@ -1000,7 +1346,17 @@ impl RootView {
         }
         let t = *crate::theme::active(cx);
         let snap = snapshot.unwrap_or(EditorSnapshot {
-            rows: vec![SnapshotRow { text: String::new(), caret_x: Some(0.0), sel_px: None }],
+            rows: vec![SnapshotRow {
+                segs: vec![SnapshotSeg {
+                    text: String::new(), size: MANUSCRIPT_FONT_SIZE,
+                    weight: FontWeight::NORMAL, mono: false,
+                    color: t.text_primary, code_bg: false,
+                    src_start: 0, src_end: 0,
+                }],
+                caret: Some((0.0, CARET_HEIGHT)),
+                sel_px: None,
+                rule: false,
+            }],
             can_undo: false,
             can_redo: false,
             words: 0,
@@ -1015,7 +1371,7 @@ impl RootView {
         let total_h = snap.rows.len() as f32 * MANUSCRIPT_LINE_HEIGHT;
         let offset = self.scroll_offset.min((total_h - view_h).max(0.0));
         let show_scroll = total_h > view_h;
-        let track_h = (view_h - 4.0).max(0.0);
+        let track_h = view_h.max(0.0);
         let thumb_h = if show_scroll {
             (view_h / total_h * track_h).max(24.0).min(track_h)
         } else {
@@ -1024,16 +1380,16 @@ impl RootView {
         let thumb_top = if show_scroll {
             let max = (total_h - view_h).max(0.0);
             if max <= 0.0 {
-                2.0
+                0.0
             } else {
-                2.0 + (offset / max) * (track_h - thumb_h).max(0.0)
+                (offset / max) * (track_h - thumb_h).max(0.0)
             }
         } else {
             0.0
         };
         let cursor_y = if show_scroll && total_h > 0.0 {
-            let idx = snap.rows.iter().position(|r| r.caret_x.is_some()).unwrap_or(0);
-            2.0 + ((idx as f32 * MANUSCRIPT_LINE_HEIGHT + MANUSCRIPT_LINE_HEIGHT / 2.0) / total_h)
+            let idx = snap.rows.iter().position(|r| r.caret.is_some()).unwrap_or(0);
+            ((idx as f32 * MANUSCRIPT_LINE_HEIGHT + MANUSCRIPT_LINE_HEIGHT / 2.0) / total_h)
                 * track_h
         } else {
             0.0
@@ -1045,6 +1401,7 @@ impl RootView {
             .flex()
             .flex_col()
             .items_center()
+            .relative()
             .overflow_hidden()
             .bg(rgba(t.bg_primary))
             .cursor_text()
@@ -1102,10 +1459,11 @@ impl RootView {
                             .top(px(-offset))
                             .flex()
                             .flex_col()
-                            .items_center()
+                            .items_start()
                             .child(
                                 div()
                                     .w(px(geo.measure))
+                                    .ml(px(manuscript_text_left(geo)))
                                     .flex()
                                     .flex_col()
                                     .pt(px(MANUSCRIPT_TOP_PAD))
@@ -1124,10 +1482,26 @@ impl RootView {
                                             .items_center()
                                             .whitespace_nowrap()
                                             .overflow_hidden()
-                                            .font_family(crate::theme::FONT_PROSE)
-                                            .text_size(px(MANUSCRIPT_FONT_SIZE))
-                                            .text_color(rgba(t.text_primary))
-                                            .child(row.text.clone())
+                                            .children(row.segs.iter().map(|seg| {
+                                                div()
+                                                    .font_family(if seg.mono { crate::theme::FONT_MONO } else { crate::theme::FONT_PROSE })
+                                                    .text_size(px(seg.size))
+                                                    .font_weight(seg.weight)
+                                                    .text_color(rgba(seg.color))
+                                                    .when(seg.code_bg, |v| v.bg(rgba(t.bg_tertiary)))
+                                                    .child(seg.text.clone())
+                                            }))
+                                            .when(row.rule, |r| {
+                                                r.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(0.))
+                                                        .right(px(0.))
+                                                        .top(px(MANUSCRIPT_LINE_HEIGHT / 2.0))
+                                                        .h(px(1.))
+                                                        .bg(rgba(t.text_secondary)),
+                                                )
+                                            })
                                             .when_some(row.sel_px, |r, range| {
                                                 let (x0, x1) = range;
                                                 r.child(
@@ -1141,19 +1515,18 @@ impl RootView {
                                                 )
                                             })
                                             .when_some(
-                                                row.caret_x.filter(|_| show_caret),
-                                                |r, x| {
+                                                row.caret.filter(|_| show_caret),
+                                                |r, (x, h)| {
                                                     r.child(
                                                         div()
                                                             .absolute()
                                                             .left(px(x))
                                                             .top(px(
-                                                                (MANUSCRIPT_LINE_HEIGHT
-                                                                    - CARET_HEIGHT)
+                                                                (MANUSCRIPT_LINE_HEIGHT - h)
                                                                     / 2.0,
                                                             ))
                                                             .w(px(2.))
-                                                            .h(px(CARET_HEIGHT))
+                                                            .h(px(h))
                                                             .bg(rgba(t.cursor)),
                                                     )
                                                 },
@@ -1161,37 +1534,67 @@ impl RootView {
                                     })
                                 )
                             )
-                    .when(show_scroll, |v| {
-                        v.child(
-                            div()
-                                .absolute()
-                                .right(px(2.))
-                                .top(px(2.))
-                                .bottom(px(2.))
-                                .w(px(12.))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(0.))
-                                        .right(px(0.))
-                                        .top(px(thumb_top - 2.))
-                                        .h(px(thumb_h))
-                                        .rounded(px(6.))
-                                        .bg(rgba(t.text_secondary))
-                                        .opacity(0.4),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(0.))
-                                        .right(px(0.))
-                                        .top(px(cursor_y - 1.))
-                                        .h(px(2.))
-                                        .bg(rgba(t.accent)),
-                                )
-                        )
-                    })
                 )
+                .when(show_scroll, |v| {
+                    v.child(
+                        div()
+                            .id("manuscript-scrollbar")
+                            .absolute()
+                            .right(px(0.))
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .w(px(8.))
+                            .cursor_pointer()
+                            .on_hover({
+                                let root = root.clone();
+                                move |hovered, _, cx| {
+                                    let _ = root.update(cx, |this, cx| {
+                                        let next = *hovered;
+                                        if this.scrollbar_hovered != next {
+                                            this.scrollbar_hovered = next;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, {
+                                let root = root.clone();
+                                move |ev: &MouseDownEvent, _, cx| {
+                                    let _ = root.update(cx, |this, cx| {
+                                        this.begin_scroll_drag(
+                                            ev.position.y.as_f32(),
+                                            thumb_top,
+                                            thumb_h,
+                                                track_h,
+                                                view_h,
+                                            cx,
+                                        );
+                                    });
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .top(px(thumb_top))
+                                    .h(px(thumb_h))
+                                    .bg(rgba(t.text_secondary))
+                                    .opacity(if self.scrollbar_hovered { 0.30 } else { 0.16 }),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .top(px(cursor_y))
+                                    .h(px(2.))
+                                    .bg(rgba(t.accent))
+                                    .opacity(0.10),
+                            ),
+                    )
+                })
             )
             .into_any_element()
     }
@@ -1205,12 +1608,14 @@ impl RootView {
         geo: &ManuscriptGeometry,
         t: crate::theme::Theme,
     ) -> gpui::AnyElement {
-        let text_left = geo.margin;
+        let text_left = manuscript_text_left(geo);
         let text_right = text_left + geo.measure;
         let shade = rgba(t.bg_tertiary);
         let tick = rgba(t.line_number);
         let num = rgba(t.empty_text_primary);
         let marker = rgba(t.text_secondary);
+        let drag_label = self.margin_drag.as_ref().map(|_| Self::measure_label(geo.measure));
+        let ruler_center = (RULER_HEIGHT - 1.0) / 2.0;
 
         // Blue margin marker: a 2px rounded line, vertically centered,
         // inside a wider invisible grab handle.
@@ -1238,7 +1643,7 @@ impl RootView {
                 .child(
                     div()
                         .w(px(2.))
-                        .h(px(18.))
+                        .h(px(14.))
                         .rounded_full()
                         .bg(marker),
                 )
@@ -1306,6 +1711,44 @@ impl RootView {
                     .text_color(num)
                     .child(k.to_string())
             }))
+            .when_some(drag_label, |r, label| {
+                r.child(
+                    div()
+                        .absolute()
+                        .left(px(text_left))
+                        .top(px(ruler_center))
+                        .w(px(geo.measure))
+                        .h(px(1.0))
+                        .overflow_hidden()
+                        .children((0..((geo.measure / 10.0).ceil() as usize)).map(|index| {
+                            div()
+                                .absolute()
+                                .left(px(index as f32 * 10.0))
+                                .top(px(0.0))
+                                .w(px(6.0))
+                                .h(px(1.0))
+                                .bg(rgba(t.text_secondary))
+                        })),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(text_left + geo.measure / 2.0 - 36.0))
+                        .top(px(3.0))
+                        .w(px(72.0))
+                        .h(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba(t.bg_primary))
+                        .border_1()
+                        .border_color(rgba(t.text_secondary))
+                        .font_family(crate::theme::FONT_MONO)
+                        .text_size(px(10.0))
+                        .text_color(rgba(t.text_secondary))
+                        .child(label),
+                )
+            })
             .child(marker_el(MarginSide::Left, text_left))
             .child(marker_el(MarginSide::Right, text_right))
             .into_any_element()
@@ -1348,14 +1791,19 @@ impl RootView {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    let _ = root.update(cx, |root, cx| {
-                        if cmd == 0 {
-                            root.new_tab(cx);
-                        } else {
-                            root.pick_file(cx);
-                        }
-                    });
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    if cmd == 0 {
+                        let _ = root.update(cx, |root, cx| root.new_file(cx));
+                    } else {
+                        let root = root.clone();
+                        window.defer(cx, move |_, cx| {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                let _ = root.update(cx, |root, cx| {
+                                    root.open_file_path(path.to_string_lossy().into_owned(), cx);
+                                });
+                            }
+                        });
+                    }
                 })
                 .child(
                     svg()
@@ -1490,7 +1938,6 @@ impl Render for RootView {
 
         // Geometry first: everything manuscript-related derives from it.
         let geo = self.geometry(window);
-        let measure_color = Hsla::from(rgba(t.text_primary));
 
         // Snapshot the active buffer once per frame: wrapped visual rows
         // with caret/selection x-edges, history flags, word count.
@@ -1522,42 +1969,48 @@ impl Render for RootView {
                             ))
                         }
                     });
-                    for vr in crate::editor::wrap_line(
-                        line_no,
-                        &text,
-                        geo.measure,
-                        &mut |s: &str| measure_text(window, s, measure_color),
-                    ) {
-                        let end = vr.end_byte.min(text.len());
-                        let row_text = text[vr.start_byte..end].to_string();
-                        // Shape the row once; caret and selection edges
-                        // split from this single layout, so kerning matches
-                        // the rendered (unsplit) text exactly.
-                        let shaped = shape_row(window, &row_text, measure_color);
-                        let at = |b: usize| {
-                            shaped.split_at(b.min(row_text.len())).0.width().as_f32()
-                        };
-                        let caret_x = if !caret_placed
-                            && line_no == cur_line
-                            && vr.start_byte <= cur_byte
-                            && cur_byte <= vr.end_byte
+                    for built in layout_line(line_no, &text, line_no != cur_line, geo.measure, window, t) {
+                        let mut shaped = Vec::new();
+                        for seg in &built.segs {
+                            let color = Hsla::from(rgba(seg.color));
+                            let sh = shape_row(window, &seg.text, color, seg.size, seg.weight, seg.mono);
+                            let w = sh.width().as_f32();
+                            shaped.push((seg.clone(), sh, w));
+                        }
+                        let row_contains_cursor = if let (Some(first), Some(last)) =
+                            (built.segs.first(), built.segs.last())
                         {
-                            caret_placed = true;
-                            let rel = cur_byte.min(end).saturating_sub(vr.start_byte);
-                            Some(at(rel))
+                            first.src_start <= cur_byte && cur_byte <= last.src_end
                         } else {
-                            None
+                            cur_byte == 0
                         };
+                        let caret = if !caret_placed
+                            && line_no == cur_line
+                            && !built.rule
+                            && row_contains_cursor
+                        {
+                            let (x, size) = locate_src(&shaped, cur_byte);
+                            caret_placed = true;
+                            Some((x, (size + 4.0).min(MANUSCRIPT_LINE_HEIGHT - 2.0)))
+                        } else { None };
                         let sel_px = sel_bytes.and_then(|(s0, s1)| {
-                            let o0 = s0.max(vr.start_byte);
-                            let o1 = s1.min(vr.end_byte);
-                            if o0 >= o1 {
-                                None
-                            } else {
-                                Some((at(o0 - vr.start_byte), at(o1 - vr.start_byte)))
+                            let mut x0 = None;
+                            let mut x1 = None;
+                            let mut x = 0.0;
+                            for (seg, sh, w) in &shaped {
+                                let a = s0.max(seg.src_start);
+                                let b = s1.min(seg.src_end);
+                                if a < b {
+                                    let local_a = sh.split_at(a - seg.src_start).0.width().as_f32();
+                                    let local_b = sh.split_at(b - seg.src_start).0.width().as_f32();
+                                    x0 = Some(x0.unwrap_or(x + local_a));
+                                    x1 = Some(x + local_b);
+                                }
+                                x += *w;
                             }
+                            x0.zip(x1)
                         });
-                        rows.push(SnapshotRow { text: row_text, caret_x, sel_px });
+                        rows.push(SnapshotRow { segs: built.segs, caret, sel_px, rule: built.rule });
                     }
                 }
                 EditorSnapshot {
@@ -1571,6 +2024,7 @@ impl Render for RootView {
         let can_undo = snapshot.as_ref().is_some_and(|s| s.can_undo);
         let can_redo = snapshot.as_ref().is_some_and(|s| s.can_redo);
         let word_count = snapshot.as_ref().map(|s| s.words).unwrap_or(0);
+        self.scroll_content_rows = snapshot.as_ref().map(|s| s.rows.len()).unwrap_or(0);
 
         div()
             .id("root")
@@ -1601,6 +2055,9 @@ impl Render for RootView {
                     .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                         this.drag_to(ev.position.x.as_f32(), cx);
                         this.margin_drag_to(ev.position.x.as_f32(), window, cx);
+                        let thumb_h = this.scrollbar_thumb_height(window);
+                        let view_h = Self::viewport_h(window);
+                        this.scroll_drag_to(ev.position.y.as_f32(), view_h, view_h, thumb_h, cx);
                     }))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
                         this.end_drag(cx);

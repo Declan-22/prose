@@ -10,94 +10,360 @@ use ropey::Rope;
 
 const UNDO_CAP: usize = 200;
 
-/// Widest byte prefix of `text` fitting `x` px (char-boundaried).
-/// Used for click positioning and visual up/down.
-pub fn byte_for_x(text: &str, x: f32, width_of: &mut dyn FnMut(&str) -> f32) -> usize {
-    if x <= 0.0 || text.is_empty() {
+/// ATX heading level of a buffer line (0 = body text): counts leading
+/// `#`s followed by a space, tab, or end of line. Clamped to 3 visual
+/// levels; deeper headings render as level 3.
+pub fn heading_level(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut hashes = 0;
+    while hashes < bytes.len() && bytes[hashes] == b'#' {
+        hashes += 1;
+    }
+    if hashes == 0 {
         return 0;
     }
-    if width_of(text) <= x {
-        return text.len();
+    match bytes.get(hashes) {
+        Some(b' ') | Some(b'\t') | None => hashes.min(3),
+        _ => 0,
     }
-    let mut lo = 0usize;
-    let mut hi = text.len();
-    while lo < hi {
-        let mut mid = (lo + hi + 1) / 2;
-        while mid > lo && !text.is_char_boundary(mid) {
-            mid -= 1;
-        }
-        if mid <= lo {
-            break;
-        }
-        if width_of(&text[..mid]) <= x {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    lo
 }
 
-/// One wrapped visual row: byte range within a buffer line. Rows cover every
-/// byte exactly once, except a single space skipped at soft breaks (a cursor
-/// byte there unambiguously ends the previous row).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Byte length of the `#... ` heading marker, or 0 when not a heading.
+pub fn heading_marker_len(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut hashes = 0;
+    while hashes < bytes.len() && bytes[hashes] == b'#' {
+        hashes += 1;
+    }
+    if hashes == 0 || hashes > 6 {
+        return 0;
+    }
+    match bytes.get(hashes) {
+        Some(b' ') | Some(b'\t') => hashes + 1,
+        None => hashes,
+        _ => 0,
+    }
+}
+
+/// A line of only `---` / `***` / `___` (3+) renders as a horizontal rule.
+pub fn is_hr_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.len() < 3 {
+        return false;
+    }
+    let mut chars = t.chars();
+    let first = chars.next().unwrap();
+    if first != '-' && first != '*' && first != '_' {
+        return false;
+    }
+    chars.all(|c| c == first)
+}
+
+/// Inline span kind. Markers (`**`, backticks, …) are never part of a span —
+/// hidden lines skip them, active lines render the raw line instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpanKind {
+    Plain,
+    Marker,
+    Bold,
+    Italic,
+    Strike,
+    Code,
+}
+
+/// Parse an active source line while keeping Markdown delimiters visible.
+/// Delimiters are separate spans so the shell can color them independently.
+pub fn parse_active_line(line: &str, marker_len: usize) -> Vec<InlineSpan> {
+    let mut spans = Vec::new();
+    let base = marker_len.min(line.len());
+    if base > 0 {
+        spans.push(InlineSpan { start: 0, end: base, kind: SpanKind::Marker });
+    }
+    let mut plain_start = base;
+    let mut i = base;
+    while i < line.len() {
+        let rest = &line[i..];
+        let opener = if rest.starts_with("**") {
+            Some((2, "**", SpanKind::Bold))
+        } else if rest.starts_with("__") {
+            Some((2, "__", SpanKind::Bold))
+        } else if rest.starts_with("~~") {
+            Some((2, "~~", SpanKind::Strike))
+        } else if rest.starts_with('`') {
+            Some((1, "`", SpanKind::Code))
+        } else if rest.starts_with('*') && !rest[1..].starts_with('*') {
+            Some((1, "*", SpanKind::Italic))
+        } else {
+            None
+        };
+        let Some((open_len, marker, kind)) = opener else {
+            i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            continue;
+        };
+        let content_start = i + open_len;
+        let content = &line[content_start..];
+        let close = if marker == "*" {
+            find_single_star(content)
+        } else {
+            content.find(marker)
+        };
+        let Some(close_rel) = close.filter(|end| *end > 0) else {
+            i += open_len;
+            continue;
+        };
+        let close_start = content_start + close_rel;
+        let close_end = close_start + marker.len();
+        if plain_start < i {
+            spans.push(InlineSpan { start: plain_start, end: i, kind: SpanKind::Plain });
+        }
+        spans.push(InlineSpan { start: i, end: content_start, kind: SpanKind::Marker });
+        spans.push(InlineSpan { start: content_start, end: close_start, kind });
+        spans.push(InlineSpan { start: close_start, end: close_end, kind: SpanKind::Marker });
+        i = close_end;
+        plain_start = i;
+    }
+    if plain_start < line.len() {
+        spans.push(InlineSpan { start: plain_start, end: line.len(), kind: SpanKind::Plain });
+    }
+    spans
+}
+
+/// Visible slice of a buffer line, in source byte coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct InlineSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SpanKind,
+}
+
+/// Parse a line into visible spans. When `hide` is false the whole line is
+/// one plain span (raw source view, markers visible). When true, heading
+/// markers and inline markup are skipped; unmatched markers stay literal.
+pub fn parse_line(line: &str, hide: bool, marker_len: usize) -> Vec<InlineSpan> {
+    if !hide {
+        return vec![InlineSpan { start: 0, end: line.len(), kind: SpanKind::Plain }];
+    }
+    let base = marker_len.min(line.len());
+    parse_inline(&line[base..], base)
+}
+
+fn parse_inline(text: &str, base: usize) -> Vec<InlineSpan> {
+    let mut spans = Vec::new();
+    // Flush pending plain text in [plain_start, i).
+    let mut plain_start = 0;
+    let mut i = 0;
+    let flush_plain = |spans: &mut Vec<InlineSpan>, end: usize, plain_start: &mut usize| {
+        if *plain_start < end {
+            // Merge with a trailing plain span when adjacent.
+            if let Some(last) = spans.last_mut() {
+                if last.kind == SpanKind::Plain && last.end == base + *plain_start {
+                    last.end = base + end;
+                    *plain_start = end;
+                    return;
+                }
+            }
+            spans.push(InlineSpan {
+                start: base + *plain_start,
+                end: base + end,
+                kind: SpanKind::Plain,
+            });
+            *plain_start = end;
+        }
+    };
+    while i < text.len() {
+        let rest = &text[i..];
+        let opener = if rest.starts_with('`') {
+            Some((1, "`", SpanKind::Code, false))
+        } else if rest.starts_with("**") {
+            Some((2, "**", SpanKind::Bold, false))
+        } else if rest.starts_with("~~") {
+            Some((2, "~~", SpanKind::Strike, false))
+        } else if rest.starts_with("__") {
+            Some((2, "__", SpanKind::Bold, false))
+        } else if rest.starts_with('*')
+            && !rest[1..].starts_with('*')
+            && (i == 0 || !text[..i].ends_with('*'))
+        {
+            Some((1, "*", SpanKind::Italic, true))
+        } else {
+            None
+        };
+        match opener {
+            Some((open_len, marker, kind, single_star)) => {
+                let content = &rest[open_len..];
+                let close = if single_star {
+                    find_single_star(content)
+                } else {
+                    content.find(marker)
+                };
+                match close {
+                    Some(rel) if !content[..rel].is_empty() => {
+                        flush_plain(&mut spans, i, &mut plain_start);
+                        spans.push(InlineSpan {
+                            start: base + i + open_len,
+                            end: base + i + open_len + rel,
+                            kind,
+                        });
+                        i += open_len + rel + marker.len();
+                        plain_start = i;
+                    }
+                    _ => {
+                        // Unmatched marker: literal, advance one char.
+                        i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    }
+                }
+            }
+            None => {
+                i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            }
+        }
+    }
+    flush_plain(&mut spans, text.len(), &mut plain_start);
+    spans
+}
+
+/// Byte index of a `*` closer (one whose next char isn't `*`), if any.
+fn find_single_star(content: &str) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'*' {
+            if bytes.get(i + 1) != Some(&b'*') {
+                return Some(i);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Wrap visible text into byte ranges fitting `measure`, resolving each
+/// candidate range's width through `width_of` (styling-aware: the caller
+/// measures subranges in their own styles). Prefers breaking before spaces.
+pub fn wrap_visible(
+    visible: &str,
+    measure: f32,
+    width_of: &mut dyn FnMut(usize, usize) -> f32,
+) -> Vec<(usize, usize)> {    if visible.is_empty() {
+        return vec![(0, 0)];
+    }
+    if width_of(0, visible.len()) <= measure {
+        return vec![(0, visible.len())];
+    }
+    // Words as (start, end) visible byte ranges (non-space runs).
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut wstart: Option<usize> = None;
+    for (b, c) in visible.char_indices() {
+        if c == ' ' || c == '\t' {
+            if let Some(s) = wstart.take() {
+                words.push((s, b));
+            }
+        } else if wstart.is_none() {
+            wstart = Some(b);
+        }
+    }
+    if let Some(s) = wstart {
+        words.push((s, visible.len()));
+    }
+    if words.is_empty() {
+        words.push((0, visible.len()));
+    }
+    let mut rows = Vec::new();
+    let mut wi = 0;
+    let mut row_start = 0;
+    let mut row_has_word = false;
+    while wi < words.len() {
+        let (ws, we) = words[wi];
+        // Width if the row ran to the word end (from row start).
+        if width_of(row_start, we) <= measure {
+            wi += 1;
+            row_has_word = true;
+            if wi == words.len() {
+                rows.push((row_start, visible.len()));
+            }
+            continue;
+        }
+        if !row_has_word {
+            // Single word overflows: force a mid-word break.
+            let mut lo = row_start;
+            let mut hi = we;
+            while lo < hi {
+                let mut mid = (lo + hi + 1) / 2;
+                while mid > lo && !visible.is_char_boundary(mid) {
+                    mid -= 1;
+                }
+                if mid <= lo {
+                    break;
+                }
+                if width_of(row_start, mid) <= measure {
+                    lo = mid;
+                } else {
+                    hi = mid.saturating_sub(1);
+                }
+            }
+            if lo <= row_start {
+                // Even one char overflows: force a single char of progress.
+                lo = visible[row_start..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(b, _)| row_start + b)
+                    .unwrap_or(visible.len());
+            }
+            rows.push((row_start, lo));
+            row_start = lo;
+            // Same word continues on the next row.
+            continue;
+        }
+        // Break before this word, skipping one space.
+        let break_end = if ws > row_start && visible.as_bytes().get(ws - 1) == Some(&b' ') {
+            ws - 1
+        } else {
+            ws
+        };
+        rows.push((row_start, break_end.max(row_start)));
+        row_start = ws;
+        row_has_word = false;
+    }
+    rows
+}
+
+/// Legacy source-row mapping used by cursor navigation. Rendering uses the
+/// styled layout path in the shell, but navigation still needs raw source
+/// byte ranges (including markdown markers).
+#[derive(Clone, Debug)]
 pub struct VisualRow {
     pub buffer_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
 }
 
-/// Greedily wrap one buffer line (no line endings) into visual rows that fit
-/// `measure` px. `width_of` measures any substring. Prefers breaking before
-/// the last space; falls back to mid-word breaks on char boundaries.
 pub fn wrap_line(
     buffer_line: usize,
     text: &str,
     measure: f32,
     width_of: &mut dyn FnMut(&str) -> f32,
 ) -> Vec<VisualRow> {
-    if text.is_empty() {
-        return vec![VisualRow { buffer_line, start_byte: 0, end_byte: 0 }];
+    wrap_visible(text, measure, &mut |a, b| width_of(&text[a..b]))
+        .into_iter()
+        .map(|(start_byte, end_byte)| VisualRow { buffer_line, start_byte, end_byte })
+        .collect()
+}
+
+pub fn byte_for_x(text: &str, x: f32, width_of: &mut dyn FnMut(&str) -> f32) -> usize {
+    if x <= 0.0 {
+        return 0;
     }
-    let mut rows = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let rest = &text[start..];
-        if width_of(rest) <= measure {
-            rows.push(VisualRow { buffer_line, start_byte: start, end_byte: text.len() });
+    let mut best = 0;
+    for (b, _) in text.char_indices().skip(1) {
+        let w = width_of(&text[..b]);
+        if w > x {
             break;
         }
-        // Widest fitting byte prefix, floored to a char boundary.
-        let mut lo = 0usize;
-        let mut hi = rest.len();
-        while lo < hi {
-            let mut mid = (lo + hi + 1) / 2;
-            while mid > lo && !rest.is_char_boundary(mid) {
-                mid -= 1;
-            }
-            if mid <= lo {
-                break;
-            }
-            if width_of(&rest[..mid]) <= measure {
-                lo = mid;
-            } else {
-                hi = mid.saturating_sub(1);
-            }
-        }
-        if lo == 0 {
-            // Even one char overflows: force a single char of progress.
-            lo = rest.char_indices().nth(1).map(|(b, _)| b).unwrap_or(rest.len());
-        }
-        // Prefer breaking before the last space (skip it); else mid-word.
-        let (end, next) = match rest[..lo].rfind(' ') {
-            Some(s) if s > 0 => (start + s, start + s + 1),
-            _ => (start + lo, start + lo),
-        };
-        rows.push(VisualRow { buffer_line, start_byte: start, end_byte: end });
-        start = next.max(start + 1);
+        best = b;
     }
-    rows
+    if width_of(text) <= x { text.len() } else { best }
 }
 
 pub struct EditorState {
@@ -394,6 +660,22 @@ impl EditorState {
     pub fn word_count(&self) -> usize {
         self.text.to_string().split_whitespace().count()
     }
+
+    /// Replace the whole buffer (file open). Clears history/selection.
+    pub fn set_text(&mut self, content: &str) {
+        let mut rope = Rope::new();
+        rope.insert(0, content);
+        self.text = rope;
+        self.cursor = 0;
+        self.sel_anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Whole buffer as a string (file save).
+    pub fn text_string(&self) -> String {
+        self.text.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -467,32 +749,84 @@ mod tests {
 
     #[test]
     fn wrap_breaks_before_spaces() {
-        let widths = |s: &str| s.len() as f32 * 10.0;
-        let rows = wrap_line(0, "aa bb cc", 45.0, &mut widths);
-        assert_eq!(rows.len(), 3);
-        assert_eq!((rows[0].start_byte, rows[0].end_byte), (0, 2));
-        assert_eq!((rows[1].start_byte, rows[1].end_byte), (3, 5));
-        assert_eq!((rows[2].start_byte, rows[2].end_byte), (6, 8));
+        let text = "aa bb cc";
+        let rows = wrap_visible(text, 45.0, &mut |a, b| (b - a) as f32 * 10.0);
+        assert_eq!(rows, vec![(0, 2), (3, 5), (6, 8)]);
     }
 
     #[test]
     fn wrap_breaks_mid_word_without_spaces() {
-        let widths = |s: &str| s.len() as f32 * 10.0;
-        let rows = wrap_line(0, "abcdefgh", 35.0, &mut widths);
+        let text = "abcdefgh";
+        let rows = wrap_visible(text, 35.0, &mut |a, b| (b - a) as f32 * 10.0);
         assert!(rows.len() >= 2);
-        // Full byte coverage, no gaps or overlaps.
-        assert_eq!(rows[0].start_byte, 0);
-        assert_eq!(rows.last().unwrap().end_byte, 8);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows.last().unwrap().1, 8);
         for pair in rows.windows(2) {
-            assert!(pair[1].start_byte >= pair[0].end_byte);
+            assert!(pair[1].0 >= pair[0].1);
         }
     }
 
     #[test]
-    fn wrap_empty_line_is_one_row() {
-        let rows = wrap_line(3, "", 100.0, &mut |_| 0.0);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].buffer_line, 3);
+    fn wrap_empty_is_one_row() {
+        let rows = wrap_visible("", 100.0, &mut |_, _| 0.0);
+        assert_eq!(rows, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn parse_hides_bold_markers() {
+        let spans = parse_line("a **bold** c", true, 0);
+        assert_eq!(spans.len(), 3);
+        assert_eq!((spans[1].start, spans[1].end, spans[1].kind), (4, 8, SpanKind::Bold));
+        // Visible text skips the markers.
+        let visible: String = spans.iter().map(|s| &"a **bold** c"[s.start..s.end]).collect();
+        assert_eq!(visible, "a bold c");
+    }
+
+    #[test]
+    fn parse_shows_raw_when_active() {
+        let line = "a **bold** c";
+        let spans = parse_line(line, false, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, line.len()));
+    }
+
+    #[test]
+    fn parse_unmatched_markers_stay_literal() {
+        let spans = parse_line("a **oops", true, 0);
+        assert!(spans.iter().all(|s| s.kind == SpanKind::Plain));
+        let visible: String = spans.iter().map(|s| &"a **oops"[s.start..s.end]).collect();
+        assert_eq!(visible, "a **oops");
+    }
+
+    #[test]
+    fn parse_code_italic_strike() {
+        let line = "`c` *i* ~~s~~";
+        let kinds: Vec<SpanKind> =
+            parse_line(line, true, 0).iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&SpanKind::Code));
+        assert!(kinds.contains(&SpanKind::Italic));
+        assert!(kinds.contains(&SpanKind::Strike));
+    }
+
+    #[test]
+    fn hr_detection() {
+        assert!(is_hr_line("---"));
+        assert!(is_hr_line("  ***  "));
+        assert!(!is_hr_line("--"));
+        assert!(is_hr_line("___"));
+        assert!(!is_hr_line("- - -"));
+    }
+
+    #[test]
+    fn headings_detect_atx_levels() {
+        assert_eq!(heading_level("plain"), 0);
+        assert_eq!(heading_level("# Title"), 1);
+        assert_eq!(heading_level("## Section"), 2);
+        assert_eq!(heading_level("### Deep"), 3);
+        assert_eq!(heading_level("###### Too deep"), 3);
+        assert_eq!(heading_level("#nospace"), 0);
+        assert_eq!(heading_level("#"), 1);
+        assert_eq!(heading_level("  # indented"), 0);
     }
 
     #[test]

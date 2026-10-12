@@ -182,7 +182,9 @@ impl gpui::RenderOnce for DockView {
             });
         let handle = match side {
             DockSide::Left => handle.right(px(-4.)),
-            DockSide::Right => handle.left(px(-4.)),
+            // Keep the right-dock resize hitbox inside the dock. The
+            // manuscript scrollbar owns the opposite edge of the seam.
+            DockSide::Right => handle.left(px(0.)),
         };
 
         let panel = div()
