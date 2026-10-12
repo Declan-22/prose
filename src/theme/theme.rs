@@ -4,7 +4,7 @@ use gpui::{BoxShadow, FontWeight, Point, px, rgba};
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Paper Mono";
 // Default manuscript face for the writing surface (overridable in settings).
-pub const FONT_PROSE: &str = "Georgia";
+pub const FONT_PROSE: &str = "Geist";
 
 /// Emphasis weight for tabs and panel text: heavier than body, lighter
 /// than semibold.

@@ -43,32 +43,15 @@ impl DockView {
                 .overflow_hidden()
                 .child(s)
         };
-        // Every row clips instead of wrapping: shrinking the dock crops
-        // content in place, nothing reflows. Rows run edge to edge — no
-        // right-side inset, so text crops exactly at the dock border.
-        let row = |s: String, primary: bool, indent: f32| {
-            div()
-                .pl(px(indent))
-                .text_sm()
-                .font_weight(WEIGHT_MEDIUM)
-                .text_color(rgba(if primary {
-                    t.text_primary
-                } else {
-                    t.text_secondary
-                }))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(s)
-        };
+        // Rows run edge to edge — no right-side inset, so text crops
+        // exactly at the dock border.
         match self.visible {
             PanelKind::Project => div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .overflow_hidden()
-                .child(row("My Novel.prose".into(), true, 8.))
-                .child(row("chapter-01.md · 2,140 words".into(), false, 24.))
-                .child(row("chapter-02.md · 1,872 words".into(), false, 24.))
+                .child(muted("No folder opened yet."))
                 .into_any_element(),
             PanelKind::Outline => div()
                 .overflow_hidden()

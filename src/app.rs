@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 
 use gpui_platform::application;
@@ -10,6 +12,7 @@ use crate::theme::{self, ThemeMode};
 
 pub fn run() {
     application().run(|cx: &mut App| {
+        load_fonts(cx);
         let store = Store::open_default();
         let saved_mode = store.get("theme.mode").map(|v| match v.as_str() {
             "light" => ThemeMode::Light,
@@ -32,9 +35,13 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
-            |_window, cx| {
+            |window, cx| {
                 let store = Store::open_default();
-                let view = cx.new(|_cx| RootView::new(store));
+                let view = cx.new(|cx| RootView::new(cx, store));
+                // Manuscript takes keyboard focus immediately; clicking it
+                // re-focuses later.
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
                 cx.set_global(RootHandle(view.downgrade()));
                 view
             },
@@ -43,6 +50,16 @@ pub fn run() {
 
         cx.activate(true);
     });
+}
+
+fn load_fonts(cx: &mut App) {
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-VariableFont_wght.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/PaperMono-Regular.ttf")),
+    ];
+    cx.text_system()
+        .add_fonts(fonts)
+        .expect("failed to load bundled fonts");
 }
 
 fn with_root(cx: &mut App, f: impl FnOnce(&mut RootView, &mut gpui::Context<RootView>)) {

@@ -9,7 +9,7 @@ use gpui::{
 
 use super::panels::{DockSide, PanelKind, ICON_PROSE_LAYER, ICON_SYNTAX};
 use super::root::{RootView, Tab};
-use crate::theme::WEIGHT_MEDIUM;
+use crate::theme::{WEIGHT_MEDIUM, lerp_rgb};
 
 pub const TOP_BAR_HEIGHT: f32 = 30.0;
 pub const TAB_BAR_HEIGHT: f32 = 32.0;
@@ -317,7 +317,8 @@ impl gpui::RenderOnce for TabBar {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .px(px(24.))
+                            .pl(px(23.))
+                            .pr(px(24.))
                             .border_b_1()
                             .border_color(rgba(if is_active {
                                 t.bg_primary
@@ -447,7 +448,7 @@ impl gpui::RenderOnce for BottomBar {
                         ),
                 )
                 .when(popup_open, |w| {
-                    w.child(dock_popup(kind, self.root.clone(), &self.left_panels, t))
+                    w.child(dock_popup(kind, self.root.clone(), &self.left_panels, t, cx))
                 })
         };
 
@@ -526,11 +527,14 @@ impl gpui::RenderOnce for BottomBar {
 }
 
 /// Dock Left / Dock Right popup, anchored above its bottom-bar button.
+/// Styled identically to the top-bar dropdown: same panel, same rows,
+/// same background-only hover tweens. The active side shows a filled dot.
 fn dock_popup(
     kind: PanelKind,
     root: WeakEntity<RootView>,
     left_panels: &[PanelKind],
     t: crate::theme::Theme,
+    cx: &App,
 ) -> AnyElement {
     let current = if left_panels.contains(&kind) {
         DockSide::Left
@@ -540,6 +544,12 @@ fn dock_popup(
     let row = |label: &'static str, side: DockSide| {
         let root = root.clone();
         let is_current = current == side;
+        // Hover tween, background-only like the dropdown entries.
+        let k = root
+            .upgrade()
+            .map(|s| s.read(cx).fade(&format!("dockpopup-{label}")))
+            .unwrap_or(0.0);
+        let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
         div()
             .id(format!("dock-{label}-{}", kind.short_label()))
             .flex()
@@ -547,13 +557,26 @@ fn dock_popup(
             .items_center()
             .justify_between()
             .h(px(24.))
-            .px(px(8.))
-            .rounded(px(4.))
+            .pl(px(4.))
+            .pr(px(4.))
+            .rounded(px(8.))
             .cursor_pointer()
-            .text_xs()
-            .font_weight(FontWeight::NORMAL)
+            .text_sm()
+            .font_weight(WEIGHT_MEDIUM)
             .text_color(rgba(t.text_primary))
-            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+            .bg(rgba(bg))
+            .on_hover({
+                let root = root.clone();
+                move |hovered, _, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        root.animate_fade(
+                            &format!("dockpopup-{label}"),
+                            if *hovered { 1.0 } else { 0.0 },
+                            cx,
+                        );
+                    });
+                }
+            })
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = root.update(cx, |root, cx| {
                     root.set_dock(kind, side, cx);
@@ -564,9 +587,13 @@ fn dock_popup(
             .child(label)
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgba(t.accent))
-                    .child(if is_current { "✓" } else { "" }),
+                    .w(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(is_current, |slot| {
+                        slot.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgba(t.accent)))
+                    }),
             )
     };
 
@@ -580,11 +607,11 @@ fn dock_popup(
         .px(px(4.))
         .py(px(4.))
         .gap(px(2.))
-        .bg(rgba(t.menu_bg))
+        .bg(rgba(t.bg_primary))
         .border_1()
         .border_color(rgba(t.menu_border_color))
-        .rounded(px(6.))
-        .shadow(vec![t.shadow_md()])
+        .rounded(px(10.))
+        .shadow(vec![t.shadow_lg()])
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .child(row("Dock Left", DockSide::Left))

@@ -57,18 +57,6 @@ impl PanelKind {
             PanelKind::Comments => "Notes",
         }
     }
-
-    /// Dock header title.
-    pub fn title(self) -> &'static str {
-        match self {
-            PanelKind::Project => "Project",
-            PanelKind::Outline => "Outline",
-            PanelKind::Styling => "Styling",
-            PanelKind::Inspector => "Inspector",
-            PanelKind::History => "History",
-            PanelKind::Comments => "Comments",
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
