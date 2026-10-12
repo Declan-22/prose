@@ -1,3 +1,8 @@
+mod app;
+mod persist;
+mod shell;
 mod theme;
 
-fn main() {}
+fn main() {
+    app::run();
+}

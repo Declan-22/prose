@@ -1,8 +1,14 @@
 use super::color::*;
-use gpui::{BoxShadow, Point, px, rgba};
+use gpui::{BoxShadow, FontWeight, Point, px, rgba};
 
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Paper Mono";
+// Default manuscript face for the writing surface (overridable in settings).
+pub const FONT_PROSE: &str = "Georgia";
+
+/// Emphasis weight for tabs and panel text: heavier than body, lighter
+/// than semibold.
+pub const WEIGHT_MEDIUM: FontWeight = FontWeight(450.0);
 
 // Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
 pub fn fade_in(color: u32, k: f32) -> u32 {
@@ -10,18 +16,18 @@ pub fn fade_in(color: u32, k: f32) -> u32 {
     (color & 0xFFFFFF00) | a
 }
 
-// Linear blend of two 0xRRGGBB colors (alpha untouched).
-pub fn lerp_rgb(from: u32, to: u32, k: f32) -> u32 {
-    let ch = |c: u32, shift: u32| ((c >> shift) & 0xFF) as f32;
-    let mix = |shift: u32| (ch(from, shift) + (ch(to, shift) - ch(from, shift)) * k).round() as u32;
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
-}
-
-// Linear blend of two 0xRRGGBBAA colors including the alpha byte.
+// Linear blend of two 0xRRGGBBAA colors (all four channels, including
+// the alpha byte). Our palette stores alpha in the low byte, so the
+// 6-digit 0xRRGGBB math used elsewhere does NOT apply here.
 pub fn lerp_rgba(from: u32, to: u32, k: f32) -> u32 {
     let ch = |c: u32, shift: u32| ((c >> shift) & 0xFF) as f32;
     let mix = |shift: u32| (ch(from, shift) + (ch(to, shift) - ch(from, shift)) * k).round() as u32;
-    (mix(24) << 24) | lerp_rgb(from & 0xFFFFFF, to & 0xFFFFFF, k)
+    (mix(24) << 24) | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+// Same as lerp_rgba; kept under the familiar name for call-site parity.
+pub fn lerp_rgb(from: u32, to: u32, k: f32) -> u32 {
+    lerp_rgba(from, to, k)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +48,8 @@ pub struct Theme {
     pub menu_bg: u32,
     pub menu_hover_bg: u32,
     pub component_border_color: u32,
+    /// Chrome separators: top/tab/bottom bars and dock edges.
+    pub chrome_border_color: u32,
 
     pub text_primary: u32,
     pub text_secondary: u32,
@@ -122,6 +130,17 @@ impl Theme {
         }
     }
 
+    // Large floating shadow for menus and popups.
+    pub fn shadow_lg(&self) -> BoxShadow {
+        BoxShadow {
+            color: rgba(self.shadow_color).into(),
+            offset: Point { x: px(0.), y: px(4.) },
+            blur_radius: px(16.),
+            spread_radius: px(0.),
+            inset: false,
+        }
+    }
+
     pub fn light() -> Self {
         Self {
             bg_primary: LIGHT_BG_PRIMARY,
@@ -134,6 +153,7 @@ impl Theme {
             menu_bg: LIGHT_MENU_BG,
             menu_hover_bg: LIGHT_MENU_HOVER_BG,
             component_border_color: LIGHT_COMPONENT_BORDER_COLOR,
+            chrome_border_color: LIGHT_CHROME_BORDER_COLOR,
 
             text_primary: LIGHT_TEXT_PRIMARY,
             text_secondary: LIGHT_TEXT_SECONDARY,
@@ -192,6 +212,7 @@ impl Theme {
             menu_bg: DARK_MENU_BG,
             menu_hover_bg: DARK_MENU_HOVER_BG,
             component_border_color: DARK_COMPONENT_BORDER_COLOR,
+            chrome_border_color: DARK_CHROME_BORDER_COLOR,
 
             text_primary: DARK_TEXT_PRIMARY,
             text_secondary: DARK_TEXT_SECONDARY,

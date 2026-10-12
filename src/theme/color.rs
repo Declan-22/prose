@@ -14,6 +14,9 @@ pub const DARK_BG_DARKER: u32 = 0x252523ff;
 pub const DARK_BORDER_COLOR: u32 = 0x30302eff;
 pub const DARK_MENU_BORDER_COLOR: u32 = 0x292927ff;
 pub const DARK_COMPONENT_BORDER_COLOR: u32 = 0x3a3a37ff;
+// Chrome separators (top/tab/bottom bars, dock edges): a middle ground —
+// softer than component borders, more present than menu borders.
+pub const DARK_CHROME_BORDER_COLOR: u32 = 0x2e2e2cff;
 
 // Menus stay on the panel tone; hover rows use the element-hover tone.
 pub const DARK_MENU_BG: u32 = DARK_BG_SECONDARY;
@@ -92,6 +95,9 @@ pub const LIGHT_BG_DARKER: u32 = 0xf1f1eeff;
 pub const LIGHT_BORDER_COLOR: u32 = 0xe5e5e2ff;
 pub const LIGHT_MENU_BORDER_COLOR: u32 = 0xecece9ff;
 pub const LIGHT_COMPONENT_BORDER_COLOR: u32 = 0xd8d8d4ff;
+// Chrome separators (top/tab/bottom bars, dock edges): a middle ground —
+// softer than component borders, more present than menu borders.
+pub const LIGHT_CHROME_BORDER_COLOR: u32 = 0xe3e3e2ff;
 
 pub const LIGHT_MENU_BG: u32 = LIGHT_BG_SECONDARY;
 pub const LIGHT_MENU_HOVER_BG: u32 = 0xecece9ff;
