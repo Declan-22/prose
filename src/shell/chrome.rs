@@ -397,6 +397,10 @@ pub struct BottomBar {
     pub word_count: usize,
     pub syntax_on: bool,
     pub prose_on: bool,
+    pub syntax_menu_open: bool,
+    pub prose_menu_open: bool,
+    pub syntax_selected: [bool; 5],
+    pub prose_selected: [bool; 8],
 }
 
 impl gpui::RenderOnce for BottomBar {
@@ -452,9 +456,10 @@ impl gpui::RenderOnce for BottomBar {
                 })
         };
 
-        let layer = |id: &'static str, label: &'static str, icon: &'static [u8], on: bool, flag: u8| {
+        let layer = |id: &'static str, label: &'static str, icon: &'static [u8], on: bool, flag: u8, open: bool, selected: Vec<bool>| {
             let root = self.root.clone();
             div()
+                .relative()
                 .id(id)
                 .h(px(26.))
                 .flex()
@@ -472,6 +477,7 @@ impl gpui::RenderOnce for BottomBar {
                     let root = root.clone();
                     move |_, _, cx| {
                         let _ = root.update(cx, |root, cx| root.toggle_layer(flag, cx));
+                        cx.stop_propagation();
                     }
                 })
                 .child(
@@ -482,6 +488,7 @@ impl gpui::RenderOnce for BottomBar {
                         .text_color(rgba(if on { t.accent } else { t.text_secondary })),
                 )
                 .child(label)
+                .when(open, |w| w.child(layer_popup(self.root.clone(), flag, selected, t, cx)))
         };
 
         div()
@@ -499,7 +506,7 @@ impl gpui::RenderOnce for BottomBar {
             .on_mouse_down(MouseButton::Left, {
                 let root = self.root.clone();
                 move |_, _, cx| {
-                    let _ = root.update(cx, |root, cx| root.close_dock_menu(cx));
+                    let _ = root.update(cx, |root, cx| { root.close_dock_menu(cx); root.close_layer_menus(cx); });
                 }
             })
             // Left group: panels docked left.
@@ -508,8 +515,8 @@ impl gpui::RenderOnce for BottomBar {
             }))
             .child(div().flex_1())
             // Center: layer toggles + word count.
-            .child(layer("layer-syntax", "Syntax", ICON_SYNTAX, self.syntax_on, 0))
-            .child(layer("layer-prose", "Prose", ICON_PROSE_LAYER, self.prose_on, 1))
+            .child(layer("layer-syntax", "Syntax", ICON_SYNTAX, self.syntax_on, 0, self.syntax_menu_open, self.syntax_selected.to_vec()))
+            .child(layer("layer-prose", "Prose", ICON_PROSE_LAYER, self.prose_on, 1, self.prose_menu_open, self.prose_selected.to_vec()))
             .child(
                 div()
                     .px(px(8.))
@@ -524,6 +531,75 @@ impl gpui::RenderOnce for BottomBar {
                 toggle(*k, Some(*k) == self.visible_right, Some(*k) == self.dock_menu)
             }))
     }
+}
+
+fn layer_popup(root: WeakEntity<RootView>, layer: u8, selected: Vec<bool>, t: crate::theme::Theme, cx: &App) -> AnyElement {
+    let labels: Vec<&'static str> = if layer == 0 {
+        crate::syntax::Kind::ALL.iter().map(|k| k.label()).collect()
+    } else {
+        crate::prose::Kind::ALL.iter().map(|k| k.label()).collect()
+    };
+    div()
+        .absolute()
+        .bottom(px(30.))
+        .left(px(0.))
+        .w(px(190.))
+        .px(px(4.))
+        .py(px(4.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .bg(rgba(t.bg_primary))
+        .border_1()
+        .border_color(rgba(t.menu_border_color))
+        .rounded(px(10.))
+        .shadow(vec![t.shadow_lg()])
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .children(labels.into_iter().enumerate().map(|(index, label)| {
+            let root = root.clone();
+            let on = selected.get(index).copied().unwrap_or(false);
+            let fade_id = format!("layerpopup-{layer}-{index}");
+            let k = root.upgrade().map(|s| s.read(cx).fade(&fade_id)).unwrap_or(0.0);
+            let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
+            let color = if layer == 0 {
+                [t.accent, t.success, t.warning, t.error, t.info][index]
+            } else {
+                [t.warning, t.error, t.info, t.accent, t.success, t.warning, t.info, t.error][index]
+            };
+            div()
+                .id(format!("layer-check-{layer}-{index}"))
+                .h(px(24.))
+                .pl(px(4.))
+                .pr(px(4.))
+                .gap(px(8.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_sm()
+                .font_weight(WEIGHT_MEDIUM)
+                .text_color(rgba(t.text_primary))
+                .bg(rgba(bg))
+                .opacity(if on { 1.0 } else { 0.42 })
+                .on_hover({
+                    let root = root.clone();
+                    let fade_id = fade_id.clone();
+                    move |hovered, _, cx| {
+                        let _ = root.update(cx, |root, cx| {
+                            root.animate_fade(&fade_id, if *hovered { 1.0 } else { 0.0 }, cx);
+                        });
+                    }
+                })
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = root.update(cx, |root, cx| root.toggle_check(layer, index, cx));
+                    cx.stop_propagation();
+                })
+                .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgba(color)))
+                .child(label)
+        }))
+        .into_any_element()
 }
 
 /// Dock Left / Dock Right popup, anchored above its bottom-bar button.

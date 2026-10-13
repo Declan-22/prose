@@ -16,6 +16,7 @@ use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
 use crate::editor::{EditorState, SpanKind};
+use crate::{prose, syntax};
 use crate::persist::Store;
 use crate::theme::{WEIGHT_MEDIUM, WEIGHT_SEMIBOLD};
 
@@ -113,6 +114,8 @@ struct SnapshotSeg {
     code_bg: bool,
     src_start: usize,
     src_end: usize,
+    underline: Option<u32>,
+    background: Option<u32>,
 }
 
 struct BuiltRow {
@@ -154,6 +157,27 @@ fn seg_chrome(kind: SpanKind, t: crate::theme::Theme) -> (u32, bool) {
     }
 }
 
+fn syntax_color(kind: syntax::Kind, t: crate::theme::Theme) -> u32 {
+    [t.accent, t.success, t.warning, t.error, t.info][kind.index()]
+}
+
+fn prose_color(kind: prose::Kind, t: crate::theme::Theme) -> u32 {
+    [t.warning, t.error, t.info, t.accent, t.success, t.warning, t.info, t.error][kind.index()]
+}
+
+fn prose_decoration(mark: &prose::Span, t: crate::theme::Theme) -> (Option<u32>, Option<u32>) {
+    if mark.kind == prose::Kind::SentenceRhythm {
+        let background = if mark.end.saturating_sub(mark.start) > 200 {
+            crate::theme::lerp_rgba(t.bg_primary, t.error, 0.28)
+        } else {
+            crate::theme::lerp_rgba(t.bg_primary, t.warning, 0.28)
+        };
+        (None, Some(background))
+    } else {
+        (Some(prose_color(mark.kind, t)), None)
+    }
+}
+
 /// Base type for a buffer line: headings render larger and semibold.
 fn base_measure(line_text: &str) -> (f32, FontWeight) {
     match crate::editor::heading_level(line_text) {
@@ -174,6 +198,8 @@ fn layout_line(
     measure: f32,
     window: &mut Window,
     t: crate::theme::Theme,
+    syntax_spans: &[syntax::Span],
+    prose_spans: &[prose::Span],
 ) -> Vec<BuiltRow> {
     if hidden && crate::editor::is_hr_line(line_text) {
         return vec![BuiltRow { buffer_line: line_no, segs: Vec::new(), rule: true }];
@@ -222,48 +248,55 @@ fn layout_line(
             let mut segs = Vec::new();
             for (idx, s) in spans.iter().enumerate() {
                 let (vs, ve) = voffs[idx];
-                let o0 = a.max(vs);
-                let o1 = b.min(ve);
-                if o0 >= o1 {
+                let visible_start = a.max(vs);
+                let visible_end = b.min(ve);
+                if visible_start >= visible_end {
                     continue;
                 }
                 let (size, weight, mono) = seg_metrics(s.kind, base_size, base_weight);
-                let (color_u32, code_bg) = seg_chrome(s.kind, t);
-                // Visible offsets back to source bytes.
-                let src_a = s.start + (o0 - vs);
-                let src_b = s.start + (o1 - vs);
-                segs.push(SnapshotSeg {
-                    text: visible[o0..o1].to_string(),
-                    size,
-                    weight,
-                    mono,
-                    color: color_u32,
-                    code_bg,
-                    src_start: src_a,
-                    src_end: src_b,
-                });
+                // Split the base Markdown span at every analysis boundary.
+                // Without this, one annotation on a line would style the
+                // entire line because Markdown parsing produces one plain span.
+                let mut cuts = vec![s.start + (visible_start - vs), s.start + (visible_end - vs)];
+                for mark in syntax_spans {
+                    if mark.start > cuts[0] && mark.start < cuts[1] { cuts.push(mark.start); }
+                    if mark.end > cuts[0] && mark.end < cuts[1] { cuts.push(mark.end); }
+                }
+                for mark in prose_spans {
+                    if mark.start > cuts[0] && mark.start < cuts[1] { cuts.push(mark.start); }
+                    if mark.end > cuts[0] && mark.end < cuts[1] { cuts.push(mark.end); }
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                for pair in cuts.windows(2) {
+                    let (src_a, src_b) = (pair[0], pair[1]);
+                    if src_a >= src_b { continue; }
+                    let o0 = vs + (src_a - s.start);
+                    let o1 = vs + (src_b - s.start);
+                    let (mut color_u32, code_bg) = seg_chrome(s.kind, t);
+                    if let Some(mark) = syntax_spans.iter().find(|a| a.start < src_b && a.end > src_a) {
+                        color_u32 = syntax_color(mark.kind, t);
+                    }
+                    let decoration = prose_spans.iter().find(|a| a.start < src_b && a.end > src_a).map(|a| prose_decoration(a, t));
+                    let underline = decoration.and_then(|(underline, _)| underline);
+                    let background = decoration.and_then(|(_, background)| background);
+                    segs.push(SnapshotSeg {
+                        text: visible[o0..o1].to_string(),
+                        size,
+                        weight,
+                        mono,
+                        color: color_u32,
+                        code_bg,
+                        src_start: src_a,
+                        src_end: src_b,
+                        underline,
+                        background,
+                    });
+                }
             }
             BuiltRow { buffer_line: line_no, segs, rule: false }
         })
         .collect()
-}
-
-/// x and segment size for a line-local source byte within shaped row segs.
-/// Gap bytes snap to the next segment start (first match wins).
-fn locate_src(shaped: &[(SnapshotSeg, ShapedLine, f32)], src: usize) -> (f32, f32) {
-    let mut x = 0.0;
-    for (seg, sh, w) in shaped {
-        if src < seg.src_start {
-            return (x, seg.size);
-        }
-        if src <= seg.src_end {
-            let rel = (src - seg.src_start).min(seg.text.len());
-            return (x + sh.split_at(rel).0.width().as_f32(), seg.size);
-        }
-        x += w;
-    }
-    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(MANUSCRIPT_FONT_SIZE);
-    (x, size)
 }
 
 struct EditorSnapshot {
@@ -319,6 +352,20 @@ fn shape_row(
         .shape_line(text.to_string().into(), px(size), &[run], None)
 }
 
+fn locate_src(shaped: &[(SnapshotSeg, ShapedLine, f32)], src: usize) -> (f32, f32) {
+    let mut x = 0.0;
+    for (seg, sh, w) in shaped {
+        if src < seg.src_start { return (x, seg.size); }
+        if src <= seg.src_end {
+            let rel = (src - seg.src_start).min(seg.text.len());
+            return (x + sh.split_at(rel).0.width().as_f32(), seg.size);
+        }
+        x += w;
+    }
+    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(MANUSCRIPT_FONT_SIZE);
+    (x, size)
+}
+
 pub struct RootView {
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -337,11 +384,17 @@ pub struct RootView {
     preview_style: Option<String>,
     syntax_on: bool,
     prose_on: bool,
+    syntax_menu_open: bool,
+    prose_menu_open: bool,
+    syntax_selected: [bool; 5],
+    prose_selected: [bool; 8],
     recent_files: Vec<String>,
     hovered_tab: Option<usize>,
     store: Store,
     /// Buffers keyed by tab id, created lazily.
     editors: HashMap<usize, EditorState>,
+    /// Cached analyzer output keyed by line contents and enabled checks.
+    analysis_cache: HashMap<(String, u8, u8), (Vec<syntax::Span>, Vec<prose::Span>)>,
     /// Manuscript focus follows the active tab.
     pub focus: FocusHandle,
     /// Manuscript measure base (text width). The only ruler quantity
@@ -460,10 +513,15 @@ impl RootView {
             preview_style: None,
             syntax_on: false,
             prose_on: false,
+            syntax_menu_open: false,
+            prose_menu_open: false,
+            syntax_selected: [false; 5],
+            prose_selected: [false; 8],
             recent_files,
             hovered_tab: None,
             store,
             editors: HashMap::new(),
+            analysis_cache: HashMap::new(),
             focus: cx.focus_handle(),
             measure_base: base_measure,
             margin_drag: None,
@@ -1185,11 +1243,21 @@ impl RootView {
 
     pub fn toggle_layer(&mut self, flag: u8, cx: &mut Context<Self>) {
         match flag {
-            LAYER_SYNTAX => self.syntax_on = !self.syntax_on,
-            LAYER_PROSE => self.prose_on = !self.prose_on,
+            LAYER_SYNTAX => { self.syntax_menu_open = !self.syntax_menu_open; self.syntax_on = self.syntax_selected.iter().any(|v| *v); self.prose_menu_open = false; }
+            LAYER_PROSE => { self.prose_menu_open = !self.prose_menu_open; self.prose_on = self.prose_selected.iter().any(|v| *v); self.syntax_menu_open = false; }
             _ => {}
         }
         cx.notify();
+    }
+
+    pub fn toggle_check(&mut self, layer: u8, index: usize, cx: &mut Context<Self>) {
+        if layer == LAYER_SYNTAX { if let Some(v) = self.syntax_selected.get_mut(index) { *v = !*v; } self.syntax_on = self.syntax_selected.iter().any(|v| *v); }
+        if layer == LAYER_PROSE { if let Some(v) = self.prose_selected.get_mut(index) { *v = !*v; } self.prose_on = self.prose_selected.iter().any(|v| *v); }
+        cx.notify();
+    }
+
+    pub fn close_layer_menus(&mut self, cx: &mut Context<Self>) {
+        if self.syntax_menu_open || self.prose_menu_open { self.syntax_menu_open = false; self.prose_menu_open = false; cx.notify(); }
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
@@ -1352,6 +1420,8 @@ impl RootView {
                     weight: FontWeight::NORMAL, mono: false,
                     color: t.text_primary, code_bg: false,
                     src_start: 0, src_end: 0,
+                    underline: None,
+                    background: None,
                 }],
                 caret: Some((0.0, CARET_HEIGHT)),
                 sel_px: None,
@@ -1489,6 +1559,8 @@ impl RootView {
                                                     .font_weight(seg.weight)
                                                     .text_color(rgba(seg.color))
                                                     .when(seg.code_bg, |v| v.bg(rgba(t.bg_tertiary)))
+                                                    .when_some(seg.background, |v, color| v.bg(rgba(color)))
+                                                    .when(seg.underline.is_some(), |v| v.underline())
                                                     .child(seg.text.clone())
                                             }))
                                             .when(row.rule, |r| {
@@ -1948,6 +2020,8 @@ impl Render for RootView {
             .filter(|tab| tab.title != "Welcome")
             .map(|tab| tab.id)
             .map(|id| {
+                let syntax_mask = self.syntax_selected.iter().enumerate().fold(0u8, |mask, (i, on)| mask | ((*on as u8) << i));
+                let prose_mask = self.prose_selected.iter().enumerate().fold(0u8, |mask, (i, on)| mask | ((*on as u8) << i));
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
                 let (cur_line, cur_byte) = ed.cursor_line_byte();
                 let sel_chars = ed.selection_range();
@@ -1969,7 +2043,19 @@ impl Render for RootView {
                             ))
                         }
                     });
-                    for built in layout_line(line_no, &text, line_no != cur_line, geo.measure, window, t) {
+                    let cache_key = (text.clone(), syntax_mask, prose_mask);
+                    let (syntax_spans, prose_spans) = self.analysis_cache
+                        .entry(cache_key)
+                        .or_insert_with(|| {
+                            let syntax_spans = if syntax_mask == 0 { Vec::new() } else { syntax::find(&text, &self.syntax_selected) };
+                            let prose_spans = if prose_mask == 0 { Vec::new() } else { prose::find(&text, &self.prose_selected) };
+                            (syntax_spans, prose_spans)
+                        })
+                        .clone();
+                    if self.analysis_cache.len() > 4096 {
+                        self.analysis_cache.clear();
+                    }
+                    for built in layout_line(line_no, &text, line_no != cur_line, geo.measure, window, t, &syntax_spans, &prose_spans) {
                         let mut shaped = Vec::new();
                         for seg in &built.segs {
                             let color = Hsla::from(rgba(seg.color));
@@ -2051,6 +2137,7 @@ impl Render for RootView {
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_menu(cx);
                         this.close_dock_menu(cx);
+                        this.close_layer_menus(cx);
                     }))
                     .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                         this.drag_to(ev.position.x.as_f32(), cx);
@@ -2099,6 +2186,10 @@ impl Render for RootView {
                 word_count,
                 syntax_on: self.syntax_on,
                 prose_on: self.prose_on,
+                syntax_menu_open: self.syntax_menu_open,
+                prose_menu_open: self.prose_menu_open,
+                syntax_selected: self.syntax_selected,
+                prose_selected: self.prose_selected,
             })
             // Menu overlay, painted last so it sits above the middle row:
             // click-away catcher first, dropdown panel after.
